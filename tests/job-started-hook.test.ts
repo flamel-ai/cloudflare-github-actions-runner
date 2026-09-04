@@ -66,6 +66,33 @@ describe("runner cache assignment hook", () => {
     }
   }, 10_000);
 
+  it("keeps waiting past the former 30-attempt assignment window", async () => {
+    let attempts = 0;
+    const server = createServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(attempts <= 30 ? 202 : 200).end();
+    });
+    const port = await listen(server);
+    const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
+    const configurationPath = join(directory, "cache-assignment");
+    await writeFile(configurationPath, `http://127.0.0.1:${port}/v1/runner-cache\nBearer runner-capability\n`, {
+      mode: 0o600,
+    });
+
+    try {
+      await expect(
+        runHook(configurationPath, {
+          CF_RUNNER_CACHE_ASSIGNMENT_POLL_SECONDS: "0",
+        }),
+      ).resolves.toEqual({ code: 0, stdout: "", stderr: "" });
+      expect(attempts).toBe(31);
+      await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await close(server);
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("fails closed on an unexpected Worker status and never prints the runner capability", async () => {
     const server = createServer((_request, response) => response.writeHead(403).end());
     const port = await listen(server);

@@ -23,12 +23,12 @@ if [ -z "$cache_endpoint" ] || [ -z "$cache_authorization" ]; then
 fi
 
 assignment_endpoint="${cache_endpoint%/v1/runner-cache}/v1/runner-cache-v2/assignment"
-assignment_max_attempts=${CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS:-30}
+assignment_max_attempts=${CF_RUNNER_CACHE_ASSIGNMENT_MAX_ATTEMPTS:-120}
 case "$assignment_max_attempts" in
-  ''|*[!0-9]*) assignment_max_attempts=30 ;;
+  ''|*[!0-9]*) assignment_max_attempts=120 ;;
 esac
 if [ "$assignment_max_attempts" -lt 1 ]; then
-  assignment_max_attempts=30
+  assignment_max_attempts=120
 fi
 assignment_poll_seconds=${CF_RUNNER_CACHE_ASSIGNMENT_POLL_SECONDS:-1}
 case "$assignment_poll_seconds" in
