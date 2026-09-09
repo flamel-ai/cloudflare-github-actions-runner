@@ -20,11 +20,9 @@ function job(jobId: string, runnerName: string, cacheScope: string): SchedulerJo
   };
 }
 
-async function provisionRunner(
+async function prepareRunner(
   scheduler: DurableObjectStub<import("../../src/account-runner-scheduler").AccountRunnerScheduler>,
   jobId: string,
-  runnerName: string,
-  runnerId: number,
 ): Promise<void> {
   await runInDurableObject(scheduler, async (_instance, state) => {
     // Admission capacity is separately covered by scheduler-policy tests. This
@@ -44,11 +42,104 @@ async function provisionRunner(
       jobId,
     );
   });
+}
+
+async function provisionRunner(
+  scheduler: DurableObjectStub<import("../../src/account-runner-scheduler").AccountRunnerScheduler>,
+  jobId: string,
+  runnerName: string,
+  runnerId: number,
+): Promise<void> {
+  await prepareRunner(scheduler, jobId);
   await scheduler.runnerProvisioned(jobId, runnerName, runnerId);
   await scheduler.runnerStarted(runnerName);
 }
 
 describe("AccountRunnerScheduler JIT cache assignments", () => {
+  it("records a JIT runner when its source job completes during creation", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("completed-during-jit-creation");
+    const sourceJob = job("510", "cf-standard-3-job-510", "refs/pull/510/merge");
+    const assignedJob = job("520", "cf-standard-3-job-520", "refs/pull/520/merge");
+
+    await scheduler.submit(sourceJob);
+    await scheduler.submit(assignedJob);
+    await prepareRunner(scheduler, sourceJob.jobId);
+    await scheduler.workflowJobCompleted(sourceJob.jobId);
+    await scheduler.runnerProvisioned(sourceJob.jobId, sourceJob.runnerName, 5_101);
+    await scheduler.runnerStopped(sourceJob.runnerName, { exitCode: 0, reason: "source reservation released" });
+
+    await expect(scheduler.cacheAssignment(sourceJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+    await expect(
+      scheduler.workflowJobStarted({
+        jobId: assignedJob.jobId,
+        runnerName: sourceJob.runnerName,
+        runnerId: 5_101,
+        target,
+        profile,
+      }),
+    ).resolves.toEqual({ accepted: true, admissions: [] });
+
+    await expect(scheduler.cacheAssignment(sourceJob.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: assignedJob.jobId,
+      cacheScope: assignedJob.cacheScope,
+    });
+    await scheduler.runnerProvisioned(sourceJob.jobId, sourceJob.runnerName, 5_101);
+    await expect(scheduler.cacheAssignment(sourceJob.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: assignedJob.jobId,
+      cacheScope: assignedJob.cacheScope,
+    });
+  });
+
+  it("expires completed JIT cache assignments after the post-job grace", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("completed-jit-cache-grace");
+    const queuedJob = job("530", "cf-standard-3-job-530", "refs/pull/530/merge");
+
+    await scheduler.submit(queuedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 5_301);
+    await scheduler.workflowJobStarted({
+      jobId: queuedJob.jobId,
+      runnerName: queuedJob.runnerName,
+      runnerId: 5_301,
+      target,
+      profile,
+    });
+    await scheduler.workflowJobCompleted(queuedJob.jobId);
+    await scheduler.runnerStopped(queuedJob.runnerName, { exitCode: 0, reason: "job completed" });
+
+    await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: queuedJob.jobId,
+      cacheScope: queuedJob.cacheScope,
+    });
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec(
+        "UPDATE scheduler_jobs SET updated_at = ? WHERE job_id = ?",
+        Date.now() - 5 * 60_000 - 1_000,
+        queuedJob.jobId,
+      );
+    });
+    await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+  });
+
+  it.each(["cancelled", "failed"])("revokes JIT cache access when the assigned job is %s", async (status) => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName(`terminal-jit-cache-${status}`);
+    const queuedJob = job("540", "cf-standard-3-job-540", "refs/pull/540/merge");
+
+    await scheduler.submit(queuedJob);
+    await provisionRunner(scheduler, queuedJob.jobId, queuedJob.runnerName, 5_401);
+    await scheduler.workflowJobStarted({
+      jobId: queuedJob.jobId,
+      runnerName: queuedJob.runnerName,
+      runnerId: 5_401,
+      target,
+      profile,
+    });
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      state.storage.sql.exec("UPDATE scheduler_jobs SET status = ? WHERE job_id = ?", status, queuedJob.jobId);
+    });
+
+    await expect(scheduler.cacheAssignment(queuedJob.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+  });
+
   it("carries the queued head SHA into the provisioning plan", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("head-sha-provisioning");
     const queuedJob = job("50", "cf-standard-3-job-50", "refs/heads/main");

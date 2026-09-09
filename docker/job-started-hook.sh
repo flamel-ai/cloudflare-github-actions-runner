@@ -45,12 +45,11 @@ while [ "$attempt" -le "$assignment_max_attempts" ]; do
   fi
   case "$status" in
     202) ;;
-    # Transient conditions, not verdicts. The assignment record is written by
-    # the Worker and read back through Cloudflare's edge, so a container can
-    # poll before its authorization is visible and see 401. 000 is curl's
-    # output for a connection failure. Keep polling inside the existing
-    # bounded window instead of failing the job on the first sample.
-    000|401|408|429|500|502|503|504) ;;
+    401)
+      printf '%s\n' '::error title=Cloudflare runner cache authentication::The Worker rejected the runner cache credential (HTTP 401). Check Worker authentication diagnostics for expiry or an invalid credential.'
+      exit 1
+      ;;
+    000|408|429|500|502|503|504) ;;
     *)
       printf '%s\n' "::error title=Cloudflare runner cache assignment::The Worker returned HTTP $status while waiting for GitHub's runner assignment."
       exit 1

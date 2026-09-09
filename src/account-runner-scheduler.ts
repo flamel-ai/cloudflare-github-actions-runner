@@ -1131,28 +1131,16 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       jobId,
       runnerName,
     );
-    const job = this.rows<JobRow>(
-      "SELECT * FROM scheduler_jobs WHERE job_id = ? AND runner_name = ? AND runner_id = ?",
-      jobId,
-      runnerName,
-      runnerId,
-    )[0];
+    const job = this.job(jobId);
     if (job === undefined) {
-      return;
+      throw new Error("Cannot register a JIT runner without its source job");
     }
     const timestamp = now();
     this.ctx.storage.sql.exec(
       `INSERT INTO scheduler_jit_runners
        (runner_name, source_job_id, github_owner, github_repository, profile_key, assigned_job_id, assignment_observed, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)
-       ON CONFLICT(runner_name) DO UPDATE SET
-         source_job_id = excluded.source_job_id,
-         github_owner = excluded.github_owner,
-         github_repository = excluded.github_repository,
-         profile_key = excluded.profile_key,
-         assigned_job_id = NULL,
-         assignment_observed = 0,
-         updated_at = excluded.updated_at`,
+       ON CONFLICT(runner_name) DO NOTHING`,
       runnerName,
       jobId,
       job.github_owner,
@@ -1220,6 +1208,9 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         assignedJob.github_owner.toLowerCase() === owner.toLowerCase() &&
         assignedJob.github_repository.toLowerCase() === repo.toLowerCase() &&
         assignedJob.profile_key === runner.profile_key &&
+        assignedJob.status !== "cancelled" &&
+        assignedJob.status !== "failed" &&
+        (assignedJob.status !== "completed" || assignedJob.updated_at >= now() - RUNNER_CACHE_POST_JOB_GRACE_MS) &&
         assignedJob.cache_scope !== ""
       ) {
         return {
@@ -1287,14 +1278,14 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
    * put the displaced job back through normal admission with a fresh JIT name.
    */
   async workflowJobStarted(input: SchedulerRunnerClaimInput): Promise<SchedulerResult> {
-    this.recordJitRunnerAssignment(input);
+    const assignmentRecorded = this.recordJitRunnerAssignment(input);
     const runnerOwner = this.rows<JobRow>(
       `SELECT * FROM scheduler_jobs
        WHERE runner_name = ? AND status IN ('provisioning', 'running', 'releasing')`,
       input.runnerName,
     )[0];
     if (runnerOwner === undefined) {
-      return { accepted: false, admissions: [] };
+      return { accepted: assignmentRecorded, admissions: [] };
     }
 
     const actualJob = this.job(input.jobId);
@@ -1391,7 +1382,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return { accepted: true, admissions };
   }
 
-  private recordJitRunnerAssignment(input: SchedulerRunnerClaimInput): void {
+  private recordJitRunnerAssignment(input: SchedulerRunnerClaimInput): boolean {
     const runner = this.rows<JitRunnerRow>(
       "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
       input.runnerName,
@@ -1405,7 +1396,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       runner.profile_key !== input.profile.key ||
       !jobMatchesRunnerClaim(assignedJob, input)
     ) {
-      return;
+      return false;
     }
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jit_runners
@@ -1415,6 +1406,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       now(),
       input.runnerName,
     );
+    return true;
   }
 
   private releaseJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {

@@ -40,8 +40,8 @@
     // Workflow re-verify the pinned private builder manifest after a deploy.
     "RUNNER_IMAGE_BUILDER_BOOTSTRAP_DEPLOYMENT_ID": "unconfigured",
     "RUNNER_IMAGE_NAME": "cloudflare-github-actions-runner-runner",
-    "RUNNER_IMAGE_SOURCE_REPOSITORY": "biw/cloudflare-github-actions-runner",
-    "RUNNER_IMAGE_SOURCE_REF": "main",
+    "RUNNER_IMAGE_SOURCE_REPOSITORY": "flamel-ai/cloudflare-github-actions-runner",
+    "RUNNER_IMAGE_SOURCE_REF": "fix/transient-cache-assignment-status",
     "RUNNER_CACHE_ENABLED": "true",
     "RUNNER_CACHE_MAX_BYTES": "100000000000",
     "RUNNER_CACHE_PREFIX": "cloudflare-github-actions-runner",

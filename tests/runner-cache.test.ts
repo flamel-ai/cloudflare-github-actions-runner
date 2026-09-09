@@ -230,12 +230,62 @@ describe("runner R2 cache", () => {
     await expect(verifyRunnerCacheAuthorization("cache-signing-key", `Bearer ${token}`, 1_001)).resolves.toEqual({
       version: 1,
       ...claimInput,
-      expiresAt: 1_801_000,
+      expiresAt: 7_201_000,
     });
     await expect(verifyRunnerCacheAuthorization("other-key", `Bearer ${token}`, 1_001)).resolves.toBeUndefined();
     await expect(
-      verifyRunnerCacheAuthorization("cache-signing-key", `Bearer ${token}`, 1_801_000),
+      verifyRunnerCacheAuthorization("cache-signing-key", `Bearer ${token}`, 7_201_000),
     ).resolves.toBeUndefined();
+  });
+
+  it("authenticates an assigned runner after the former 30-minute expiry", async () => {
+    const environment = actionCacheEnvironment(actionCacheBucket());
+    const cacheAssignment = vi.fn<() => Promise<TestCacheAssignmentResult>>().mockResolvedValue({
+      jobId: "actual-job",
+      cacheScope: { scope: "refs/pull/2/merge", writeAllowed: true },
+    });
+    const response = await handleRunnerCacheV2Request(
+      new Request("https://runner.example/v1/runner-cache-v2/assignment", {
+        headers: { Authorization: await authorization(claimInput, Date.now() - 45 * 60 * 1_000) },
+      }),
+      environment,
+      { cacheAssignment },
+    );
+    expect(response.status).toBe(200);
+    expect(cacheAssignment).toHaveBeenCalledWith(claimInput.runnerName, claimInput.repository);
+  });
+
+  it("rejects expired and incorrectly signed credentials before assignment lookup without leaking them", async () => {
+    const environment = actionCacheEnvironment(actionCacheBucket());
+    const cacheAssignment = vi.fn<() => Promise<TestCacheAssignmentResult>>();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const expired = await authorization(claimInput, Date.now() - 2 * 60 * 60 * 1_000);
+    const wrongKey = `Bearer ${await createRunnerCacheAuthorization("wrong-key", claimInput)}`;
+    try {
+      for (const credential of [expired, wrongKey]) {
+        const response = await handleRunnerCacheV2Request(
+          new Request("https://runner.example/v1/runner-cache-v2/assignment", {
+            headers: { Authorization: credential },
+          }),
+          environment,
+          { cacheAssignment },
+        );
+        expect(response.status).toBe(401);
+        expect(JSON.stringify(warning.mock.calls)).not.toContain(credential.slice(7));
+      }
+      expect(cacheAssignment).not.toHaveBeenCalled();
+      expect(warning).toHaveBeenCalledWith("Cloudflare runner cache authentication rejected", {
+        reason: "expired",
+        runnerName: claimInput.runnerName,
+        jobId: claimInput.jobId,
+        expiresAt: expect.any(Number),
+      });
+      expect(warning).toHaveBeenCalledWith("Cloudflare runner cache authentication rejected", {
+        reason: "invalid-signature-or-encoding",
+      });
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it("streams an exact repository cache hit through the Worker binding", async () => {

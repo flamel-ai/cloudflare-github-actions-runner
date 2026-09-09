@@ -148,14 +148,11 @@ describe("runner cache assignment hook", () => {
     }
   });
 
-  it("keeps polling when the assignment authorization is not yet visible", async () => {
-    // The Worker writes the assignment record and the container reads it back
-    // through Cloudflare's edge, so the first samples can 401 before the
-    // authorization propagates. That is a race, not a verdict.
+  it("keeps polling through a transient Worker failure", async () => {
     let attempts = 0;
     const server = createServer((_request, response) => {
       attempts += 1;
-      response.writeHead(attempts < 3 ? 401 : 200).end();
+      response.writeHead(attempts < 3 ? 503 : 200).end();
     });
     const port = await listen(server);
     const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
@@ -179,8 +176,12 @@ describe("runner cache assignment hook", () => {
     }
   });
 
-  it("still fails closed when the authorization never becomes visible", async () => {
-    const server = createServer((_request, response) => response.writeHead(401).end());
+  it("fails immediately with an authentication error when the credential is rejected", async () => {
+    let attempts = 0;
+    const server = createServer((_request, response) => {
+      attempts += 1;
+      response.writeHead(401).end();
+    });
     const port = await listen(server);
     const directory = await mkdtemp(join(tmpdir(), "runner-job-hook-test-"));
     const configurationPath = join(directory, "cache-assignment");
@@ -195,10 +196,11 @@ describe("runner cache assignment hook", () => {
       expect(result).toEqual({
         code: 1,
         stdout:
-          "::error title=Cloudflare runner cache assignment::GitHub's runner assignment was not observed within 2 seconds (last Worker status: 401).\n",
+          "::error title=Cloudflare runner cache authentication::The Worker rejected the runner cache credential (HTTP 401). Check Worker authentication diagnostics for expiry or an invalid credential.\n",
         stderr: "",
       });
       expect(result.stdout).not.toContain(capability);
+      expect(attempts).toBe(1);
       await expect(readFile(configurationPath)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await close(server);

@@ -2,7 +2,9 @@ import { z } from "zod";
 
 import type { GitHubRepositoryTarget } from "./github-repository";
 
-const runnerCacheTokenLifetimeMs = 30 * 60 * 1_000;
+// Cover the Container's one-hour inactivity window plus provisioning and shutdown time.
+// The scheduler still checks the assigned job and bounds writes after completion.
+const runnerCacheTokenLifetimeMs = 2 * 60 * 60 * 1_000;
 const cacheKeyPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,239}$/u;
 const actionCacheTokenLifetimeMs = 30 * 60 * 1_000;
 
@@ -333,21 +335,38 @@ export async function verifyRunnerCacheAuthorization(
   now = Date.now(),
 ): Promise<RunnerCacheClaim | undefined> {
   if (!hasValue(secret) || authorization === null || !authorization.startsWith("Bearer ")) {
+    console.warn("Cloudflare runner cache authentication rejected", { reason: "missing-configuration-or-bearer" });
     return undefined;
   }
   const [encodedClaim, encodedSignature, extraPart] = authorization.slice("Bearer ".length).split(".");
   if (encodedClaim === undefined || encodedSignature === undefined || extraPart !== undefined) {
+    console.warn("Cloudflare runner cache authentication rejected", { reason: "malformed-token" });
     return undefined;
   }
   const payload = decodeBase64Url(encodedClaim);
   const signature = decodeBase64Url(encodedSignature);
   if (payload === undefined || signature === undefined || !(await hasValidSignature(secret, payload, signature))) {
+    console.warn("Cloudflare runner cache authentication rejected", { reason: "invalid-signature-or-encoding" });
     return undefined;
   }
   try {
     const claim = runnerCacheClaimSchema.safeParse(JSON.parse(new TextDecoder().decode(payload)));
-    return claim.success && claim.data.expiresAt > now ? claim.data : undefined;
+    if (!claim.success) {
+      console.warn("Cloudflare runner cache authentication rejected", { reason: "invalid-claim" });
+      return undefined;
+    }
+    if (claim.data.expiresAt <= now) {
+      console.warn("Cloudflare runner cache authentication rejected", {
+        reason: "expired",
+        runnerName: claim.data.runnerName,
+        jobId: claim.data.jobId,
+        expiresAt: claim.data.expiresAt,
+      });
+      return undefined;
+    }
+    return claim.data;
   } catch {
+    console.warn("Cloudflare runner cache authentication rejected", { reason: "invalid-claim" });
     return undefined;
   }
 }
