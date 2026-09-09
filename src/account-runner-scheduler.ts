@@ -87,6 +87,7 @@ interface JobRow {
   cache_fallback_scope: string | null;
   cache_write_allowed: number;
   github_assignment_observed: number;
+  github_completed_at: number | null;
   profile_json: string;
   profile_key: string;
   vcpu: number;
@@ -372,6 +373,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         cache_fallback_scope TEXT,
         cache_write_allowed INTEGER NOT NULL DEFAULT 0,
         github_assignment_observed INTEGER NOT NULL DEFAULT 0,
+        github_completed_at INTEGER,
         profile_json TEXT NOT NULL,
         profile_key TEXT NOT NULL,
         vcpu REAL NOT NULL,
@@ -496,6 +498,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       ["cache_fallback_scope", "TEXT"],
       ["cache_write_allowed", "INTEGER NOT NULL DEFAULT 0"],
       ["github_assignment_observed", "INTEGER NOT NULL DEFAULT 0"],
+      ["github_completed_at", "INTEGER"],
       ["runner_attempt", "INTEGER NOT NULL DEFAULT 1"],
       ["container_stopped_at", "INTEGER"],
       ["container_exit_code", "INTEGER"],
@@ -508,6 +511,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     for (const [name, definition] of jobColumnMigrations) {
       if (!jobColumns.some((column) => column.name === name)) {
         this.ctx.storage.sql.exec(`ALTER TABLE scheduler_jobs ADD COLUMN ${name} ${definition}`);
+        if (name === "github_completed_at") {
+          this.ctx.storage.sql.exec(
+            `UPDATE scheduler_jobs SET github_completed_at = updated_at
+             WHERE status IN ('completed', 'cancelled', 'releasing')`,
+          );
+        }
       }
     }
     // Jobs that were queued before the pool became multi-repository belong to
@@ -1208,9 +1217,8 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         assignedJob.github_owner.toLowerCase() === owner.toLowerCase() &&
         assignedJob.github_repository.toLowerCase() === repo.toLowerCase() &&
         assignedJob.profile_key === runner.profile_key &&
-        assignedJob.status !== "cancelled" &&
-        assignedJob.status !== "failed" &&
-        (assignedJob.status !== "completed" || assignedJob.updated_at >= now() - RUNNER_CACHE_POST_JOB_GRACE_MS) &&
+        (assignedJob.github_completed_at === null ||
+          assignedJob.github_completed_at >= now() - RUNNER_CACHE_POST_JOB_GRACE_MS) &&
         assignedJob.cache_scope !== ""
       ) {
         return {
@@ -1228,10 +1236,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
        WHERE runner_name = ?
          AND lower(github_owner) = lower(?)
          AND lower(github_repository) = lower(?)
-         AND (
-           status IN ('provisioning', 'running', 'releasing')
-           OR (status = 'completed' AND updated_at >= ?)
-         )`,
+         AND (github_completed_at IS NULL OR github_completed_at >= ?)`,
       runnerName,
       owner,
       repo,
@@ -1258,11 +1263,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
          AND runner_name = ?
          AND lower(github_owner) = lower(?)
          AND lower(github_repository) = lower(?)
-         AND status IN ('provisioning', 'running', 'releasing')`,
+         AND (github_completed_at IS NULL OR github_completed_at >= ?)`,
       jobId,
       runnerName,
       owner,
       repo,
+      now() - RUNNER_CACHE_POST_JOB_GRACE_MS,
     )[0];
     if (job === undefined || job.github_assignment_observed === 0 || job.cache_scope === "") {
       return undefined;
@@ -1473,6 +1479,11 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if (job === undefined) {
       return { accepted: false, admissions: [] };
     }
+    this.ctx.storage.sql.exec(
+      "UPDATE scheduler_jobs SET github_completed_at = COALESCE(github_completed_at, ?) WHERE job_id = ?",
+      now(),
+      jobId,
+    );
     if (job.status === "queued" || job.status === "admitted") {
       this.releaseJob(job, "cancelled", "GitHub completed before the runner started");
       this.recordEvent("github-job-completed-before-start", { jobId, slotId: job.slot_id ?? undefined });
