@@ -1515,8 +1515,16 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     if (
       runner?.assigned_job_id == null ||
       runner.assigned_job_id === job.job_id ||
-      this.job(runner.assigned_job_id) !== undefined ||
       this.completionBeforeQueue(runner.assigned_job_id) !== undefined
+    )
+      return false;
+    const assigned = this.job(runner.assigned_job_id);
+    if (
+      assigned?.github_completed_at != null ||
+      (assigned !== undefined &&
+        assigned.github_owner.toLowerCase() === runner.github_owner.toLowerCase() &&
+        assigned.github_repository.toLowerCase() === runner.github_repository.toLowerCase() &&
+        assigned.profile_key === runner.profile_key)
     )
       return false;
     // A pending signed assignment retains its existing physical reservation,

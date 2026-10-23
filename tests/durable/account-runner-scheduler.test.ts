@@ -154,6 +154,69 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
     },
   );
 
+  it("retains the physical slot when pending assignment is followed by provisioning failure", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("pending-provisioning-failure");
+    const source = job("750", "cf-standard-3-job-750", "refs/pull/750/merge");
+    const assigned = job("760", "cf-standard-3-job-760", "refs/pull/760/merge");
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, 7501);
+    await scheduler.workflowJobStarted({
+      jobId: assigned.jobId,
+      runnerName: source.runnerName,
+      runnerId: 7501,
+      target,
+      profile,
+    });
+    expect((await scheduler.provisioningFailed(source.jobId, "replacement failed")).admissions).toEqual([]);
+    await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+    const result = await scheduler.submit(assigned);
+    expect(result.admissions.every((item) => item.jobId !== assigned.jobId)).toBe(true);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      const row = state.storage.sql
+        .exec<{ status: string; slot_id: string | null; runner_id: number | null }>(
+          "SELECT status,slot_id,runner_id FROM scheduler_jobs WHERE job_id = ?",
+          assigned.jobId,
+        )
+        .one();
+      expect(row).toEqual({ status: "running", slot_id: "preset:standard-3", runner_id: 7501 });
+    });
+  });
+
+  it.each(["repository", "profile"])(
+    "keeps pending reservation when queued authorization has another %s",
+    async (boundary) => {
+      const scheduler = env.RUNNER_SCHEDULER.getByName(`pending-mismatch-${boundary}`);
+      const source = job("770", "cf-standard-3-job-770", "refs/pull/770/merge");
+      const assigned = job("780", "cf-standard-3-job-780", "refs/pull/780/merge");
+      await scheduler.submit(source);
+      await provisionRunner(scheduler, source.jobId, source.runnerName, 7701);
+      await scheduler.workflowJobCompleted(source.jobId);
+      await scheduler.workflowJobStarted({
+        jobId: assigned.jobId,
+        runnerName: source.runnerName,
+        runnerId: 7701,
+        target,
+        profile,
+      });
+      const queued =
+        boundary === "repository"
+          ? { ...assigned, target: { ...target, repository: "other" } }
+          : { ...assigned, profile: RUNNER_PROFILES["standard-2"] };
+      await scheduler.submit(queued);
+      await scheduler.provisioningFailed(source.jobId, "replacement failed");
+      await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+      await runInDurableObject(scheduler, async (_instance, state) => {
+        const row = state.storage.sql
+          .exec<{ status: string; slot_id: string | null }>(
+            "SELECT status,slot_id FROM scheduler_jobs WHERE job_id = ?",
+            source.jobId,
+          )
+          .one();
+        expect(row).toEqual({ status: "releasing", slot_id: "preset:standard-3" });
+      });
+    },
+  );
+
   it.each(["stop", "completion", "expiry"])(
     "ends pending reservation after %s without granting early cache access",
     async (ending) => {
