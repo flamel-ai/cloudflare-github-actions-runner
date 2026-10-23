@@ -4,7 +4,7 @@ import type { GitHubRepositoryTarget } from "./github-repository";
 
 // Cover the Container's one-hour inactivity window plus provisioning and shutdown time.
 // The scheduler still checks the assigned job and bounds writes after completion.
-const runnerCacheTokenLifetimeMs = 2 * 60 * 60 * 1_000;
+export const runnerCacheTokenLifetimeMs = 2 * 60 * 60 * 1_000;
 const cacheKeyPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,239}$/u;
 const actionCacheTokenLifetimeMs = 30 * 60 * 1_000;
 
