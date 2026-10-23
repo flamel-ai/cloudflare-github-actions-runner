@@ -2,6 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vite-plus/test";
 
 import { AccountRunnerScheduler, type SchedulerJobInput } from "../../src/account-runner-scheduler";
+import type { WorkerEnvironment } from "../../src/environment";
 import { runnerCacheTokenLifetimeMs } from "../../src/runner-cache";
 import { RUNNER_PROFILES } from "../../src/runner-profiles";
 
@@ -117,7 +118,8 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
           Date.now() - 1,
           source.jobId,
         );
-        const restarted = new AccountRunnerScheduler(state, env);
+        // SAFETY: Constructor recovery reads the generated slot bindings and SQLite state; it does not use omitted production secrets.
+        const restarted = new AccountRunnerScheduler(state, env as WorkerEnvironment);
         await state.blockConcurrencyWhile(async () => {});
         await restarted.alarm();
         const row = state.storage.sql
