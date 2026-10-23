@@ -437,6 +437,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS scheduler_events_recent ON scheduler_events(created_at DESC, event_id DESC);
+      CREATE INDEX IF NOT EXISTS scheduler_events_job_kind ON scheduler_events(job_id, kind, created_at);
       CREATE TABLE IF NOT EXISTS scheduler_jit_runners (
         runner_name TEXT PRIMARY KEY,
         source_job_id TEXT NOT NULL,
@@ -919,6 +920,15 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     }
   }
 
+  private completionBeforeQueue(jobId: string): number | undefined {
+    // Events are append-only. Retain the first signed completion even when
+    // queued-webhook authorization has not yet created the actual job row.
+    return this.rows<{ created_at: number }>(
+      "SELECT created_at FROM scheduler_events WHERE job_id = ? AND kind = 'github-job-completed-before-queue' ORDER BY created_at LIMIT 1",
+      jobId,
+    )[0]?.created_at;
+  }
+
   async submit(job: SchedulerJobInput): Promise<SchedulerResult> {
     const existing = this.job(job.jobId);
     if (existing !== undefined) {
@@ -971,6 +981,29 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       },
     });
 
+    const completedAt = this.completionBeforeQueue(job.jobId);
+    if (completedAt !== undefined) {
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'cancelled', github_completed_at = ?, failure_reason = 'GitHub completed before queued delivery' WHERE job_id = ?",
+        completedAt,
+        job.jobId,
+      );
+      return { accepted: true, admissions: [] };
+    }
+
+    const pending = this.rows<JitRunnerRow>(
+      "SELECT * FROM scheduler_jit_runners WHERE assigned_job_id = ? AND assignment_observed = 1 ORDER BY updated_at LIMIT 1",
+      job.jobId,
+    )[0];
+    if (pending !== undefined) {
+      const replay = await this.workflowJobStarted({
+        jobId: job.jobId,
+        runnerName: pending.runner_name,
+        target: job.target,
+        profile: job.profile,
+      });
+      if (replay.accepted) return replay;
+    }
     const admissions = this.admitNext();
     await this.scheduleWorkAlarmIfNeeded();
     const stored = this.job(job.jobId);
@@ -1214,6 +1247,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       const assignedJob = this.job(runner.assigned_job_id);
       if (
         assignedJob !== undefined &&
+        assignedJob.github_assignment_observed === 1 &&
         assignedJob.github_owner.toLowerCase() === owner.toLowerCase() &&
         assignedJob.github_repository.toLowerCase() === repo.toLowerCase() &&
         assignedJob.profile_key === runner.profile_key &&
@@ -1284,22 +1318,48 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
    * put the displaced job back through normal admission with a fresh JIT name.
    */
   async workflowJobStarted(input: SchedulerRunnerClaimInput): Promise<SchedulerResult> {
+    const actualJob = this.job(input.jobId);
+    if (this.completionBeforeQueue(input.jobId) !== undefined || actualJob?.github_completed_at != null) {
+      return { accepted: false, admissions: [] };
+    }
     const assignmentRecorded = this.recordJitRunnerAssignment(input);
+    const jitRunner = this.rows<JitRunnerRow>(
+      "SELECT * FROM scheduler_jit_runners WHERE runner_name = ?",
+      input.runnerName,
+    )[0];
+    if (jitRunner !== undefined && !assignmentRecorded) {
+      return { accepted: false, admissions: [] };
+    }
+    if (actualJob === undefined) {
+      // A signed start can beat queued-webhook authorization. The known JIT
+      // identity holds this claim, but cache access still needs the real job.
+      return { accepted: assignmentRecorded, admissions: [] };
+    }
+    if (assignmentRecorded) {
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jobs SET github_assignment_observed = 1 WHERE job_id = ?",
+        input.jobId,
+      );
+    }
     const runnerOwner = this.rows<JobRow>(
       `SELECT * FROM scheduler_jobs
        WHERE runner_name = ? AND status IN ('provisioning', 'running', 'releasing')`,
       input.runnerName,
     )[0];
     if (runnerOwner === undefined) {
+      if (assignmentRecorded && (actualJob.status === "queued" || actualJob.status === "admitted")) {
+        this.ctx.storage.sql.exec(
+          "UPDATE scheduler_jobs SET status = 'running', runner_name = ?, runner_id = ?, updated_at = ? WHERE job_id = ?",
+          input.runnerName,
+          input.runnerId ?? null,
+          now(),
+          input.jobId,
+        );
+      }
       return { accepted: assignmentRecorded, admissions: [] };
     }
 
-    const actualJob = this.job(input.jobId);
-    if (
-      !jobMatchesRunnerClaim(runnerOwner, input) ||
-      actualJob === undefined ||
-      !jobMatchesRunnerClaim(actualJob, input)
-    ) {
+    if (!jobMatchesRunnerClaim(runnerOwner, input) || !jobMatchesRunnerClaim(actualJob, input)) {
       this.recordEvent("github-job-started-with-unmatched-runner", {
         jobId: input.jobId,
         slotId: runnerOwner.slot_id ?? undefined,
@@ -1343,19 +1403,30 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     const retryAttempt = runnerOwner.runner_attempt + 1;
     const retryRunnerName = `${runnerOwner.runner_name.replace(/-r\d+$/u, "")}-r${retryAttempt}`;
 
-    this.ctx.storage.sql.exec(
-      `UPDATE scheduler_jobs
+    if (runnerOwner.github_completed_at !== null) {
+      // Transfer the reservation without resurrecting the completed source or
+      // scheduling cleanup of the JIT runner now executing the actual job.
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jobs SET status = 'completed', runner_name = ?, slot_id = NULL, runner_id = NULL, recovery_due_at = NULL, updated_at = ? WHERE job_id = ?",
+        retryRunnerName,
+        timestamp,
+        runnerOwner.job_id,
+      );
+    } else {
+      this.ctx.storage.sql.exec(
+        `UPDATE scheduler_jobs
        SET status = 'queued', runner_name = ?, runner_attempt = ?, slot_id = NULL, runner_id = NULL,
            failure_reason = ?, container_stopped_at = NULL, container_exit_code = NULL,
            container_stop_reason = NULL, recovery_due_at = NULL, runner_cleanup_state = 'none',
            runner_cleanup_due_at = NULL, github_assignment_observed = 0, updated_at = ?
        WHERE job_id = ?`,
-      retryRunnerName,
-      retryAttempt,
-      `JIT runner ${input.runnerName} was assigned to GitHub job ${input.jobId}; retrying with a fresh runner`,
-      timestamp,
-      runnerOwner.job_id,
-    );
+        retryRunnerName,
+        retryAttempt,
+        `JIT runner ${input.runnerName} was assigned to GitHub job ${input.jobId}; retrying with a fresh runner`,
+        timestamp,
+        runnerOwner.job_id,
+      );
+    }
     this.ctx.storage.sql.exec(
       `UPDATE scheduler_jobs
        SET status = 'running', runner_name = ?, slot_id = ?, runner_id = ?, failure_reason = NULL,
@@ -1378,10 +1449,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
         fromJobId: runnerOwner.job_id,
       },
     });
-    this.recordEvent("github-job-requeued-after-jit-mismatch", {
-      jobId: runnerOwner.job_id,
-      detail: { runnerName: retryRunnerName, assignedJobId: actualJob.job_id, retryAttempt },
-    });
+    if (runnerOwner.github_completed_at === null) {
+      this.recordEvent("github-job-requeued-after-jit-mismatch", {
+        jobId: runnerOwner.job_id,
+        detail: { runnerName: retryRunnerName, assignedJobId: actualJob.job_id, retryAttempt },
+      });
+    }
 
     const admissions = this.admitNext();
     await this.scheduleWorkAlarmIfNeeded();
@@ -1396,11 +1469,11 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     const assignedJob = this.job(input.jobId);
     if (
       runner === undefined ||
-      assignedJob === undefined ||
+      (runner.assigned_job_id !== null && runner.assigned_job_id !== input.jobId) ||
       runner.github_owner.toLowerCase() !== input.target.owner.toLowerCase() ||
       runner.github_repository.toLowerCase() !== input.target.repository.toLowerCase() ||
       runner.profile_key !== input.profile.key ||
-      !jobMatchesRunnerClaim(assignedJob, input)
+      (assignedJob !== undefined && !jobMatchesRunnerClaim(assignedJob, input))
     ) {
       return false;
     }
@@ -1477,7 +1550,10 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   async workflowJobCompleted(jobId: string): Promise<SchedulerResult> {
     const job = this.job(jobId);
     if (job === undefined) {
-      return { accepted: false, admissions: [] };
+      if (this.completionBeforeQueue(jobId) === undefined) {
+        this.recordEvent("github-job-completed-before-queue", { jobId });
+      }
+      return { accepted: true, admissions: [] };
     }
     this.ctx.storage.sql.exec(
       "UPDATE scheduler_jobs SET github_completed_at = COALESCE(github_completed_at, ?) WHERE job_id = ?",

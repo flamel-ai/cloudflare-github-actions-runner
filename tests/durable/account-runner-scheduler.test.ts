@@ -56,6 +56,91 @@ async function provisionRunner(
 }
 
 describe("AccountRunnerScheduler JIT cache assignments", () => {
+  it.each([false, true])("replays assignment before queued delivery with completed source %s", async (completed) => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName(`pending-assignment-${completed}`);
+    const source = job("610", "cf-standard-3-job-610", "refs/pull/610/merge");
+    const assigned = job("620", "cf-standard-3-job-620", "refs/pull/620/merge");
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, 6101);
+    if (completed) await scheduler.workflowJobCompleted(source.jobId);
+    const claim = { jobId: assigned.jobId, runnerName: source.runnerName, runnerId: 6101, target, profile };
+    await scheduler.workflowJobStarted(claim);
+    await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+    await scheduler.submit(assigned);
+    await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toEqual({
+      jobId: assigned.jobId,
+      cacheScope: assigned.cacheScope,
+    });
+    await scheduler.workflowJobStarted(claim);
+    await scheduler.submit(assigned);
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      const row = state.storage.sql
+        .exec<{ status: string; github_completed_at: number | null }>(
+          "SELECT status, github_completed_at FROM scheduler_jobs WHERE job_id = ?",
+          source.jobId,
+        )
+        .one();
+      expect(completed ? ["completed"] : ["queued", "admitted"]).toContain(row.status);
+      const actual = state.storage.sql
+        .exec<{ status: string }>("SELECT status FROM scheduler_jobs WHERE job_id = ?", assigned.jobId)
+        .one();
+      expect(actual.status).toBe("running");
+    });
+  });
+
+  it.each([false, true])("completion before queued delivery wins with start first %s", async (startFirst) => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName(`pending-completion-${startFirst}`);
+    const source = job("630", "cf-standard-3-job-630", "refs/pull/630/merge");
+    const assigned = job("640", "cf-standard-3-job-640", "refs/pull/640/merge");
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, 6301);
+    const claim = { jobId: assigned.jobId, runnerName: source.runnerName, runnerId: 6301, target, profile };
+    if (startFirst) await scheduler.workflowJobStarted(claim);
+    await scheduler.workflowJobCompleted(assigned.jobId);
+    const firstCompletion = await runInDurableObject(scheduler, async (_instance, state) => {
+      return state.storage.sql
+        .exec<{ created_at: number }>(
+          "SELECT created_at FROM scheduler_events WHERE job_id = ? AND kind = 'github-job-completed-before-queue'",
+          assigned.jobId,
+        )
+        .one().created_at;
+    });
+    await scheduler.workflowJobStarted(claim);
+    await scheduler.workflowJobCompleted(assigned.jobId);
+    const result = await scheduler.submit(assigned);
+    expect(result.admissions).toEqual([]);
+    await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+    await runInDurableObject(scheduler, async (_instance, state) => {
+      const row = state.storage.sql
+        .exec<{ status: string; github_completed_at: number }>(
+          "SELECT status, github_completed_at FROM scheduler_jobs WHERE job_id = ?",
+          assigned.jobId,
+        )
+        .one();
+      expect(row.status).toBe("cancelled");
+      expect(row.github_completed_at).toBe(firstCompletion);
+    });
+  });
+
+  it("refuses conflicting pending claims and mismatched queued authorization", async () => {
+    const scheduler = env.RUNNER_SCHEDULER.getByName("pending-assignment-boundaries");
+    const source = job("650", "cf-standard-3-job-650", "refs/pull/650/merge");
+    const assigned = job("660", "cf-standard-3-job-660", "refs/pull/660/merge");
+    await scheduler.submit(source);
+    await provisionRunner(scheduler, source.jobId, source.runnerName, 6501);
+    const claim = { jobId: assigned.jobId, runnerName: source.runnerName, runnerId: 6501, target, profile };
+    await expect(
+      scheduler.workflowJobStarted({ ...claim, target: { ...target, repository: "other" } }),
+    ).resolves.toMatchObject({ accepted: false });
+    await expect(
+      scheduler.workflowJobStarted({ ...claim, profile: RUNNER_PROFILES["standard-2"] }),
+    ).resolves.toMatchObject({ accepted: false });
+    await scheduler.workflowJobStarted(claim);
+    await expect(scheduler.workflowJobStarted({ ...claim, jobId: "670" })).resolves.toMatchObject({ accepted: false });
+    await scheduler.submit({ ...assigned, target: { ...target, repository: "other" } });
+    await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+  });
+
   it("records a JIT runner when its source job completes during creation", async () => {
     const scheduler = env.RUNNER_SCHEDULER.getByName("completed-during-jit-creation");
     const sourceJob = job("510", "cf-standard-3-job-510", "refs/pull/510/merge");
