@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { z } from "zod";
 
 import { prepareRunnerApplication, reconcileRunnerApplicationCapacity } from "./cloudflare-containers";
+import { runnerCacheTokenLifetimeMs } from "./runner-cache";
 import type { WorkerEnvironment } from "./environment";
 import { githubRunnerTokenFor, type GitHubRepositoryTarget } from "./github-repository";
 import { githubTokenForRunner } from "./github-app";
@@ -1348,13 +1349,27 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     )[0];
     if (runnerOwner === undefined) {
       if (assignmentRecorded && (actualJob.status === "queued" || actualJob.status === "admitted")) {
+        const source = jitRunner === undefined ? undefined : this.job(jitRunner.source_job_id);
+        const runnerId = input.runnerId ?? source?.runner_id ?? null;
+        if (source?.runner_name === input.runnerName && source.job_id !== input.jobId) {
+          this.ctx.storage.sql.exec(
+            "UPDATE scheduler_jobs SET runner_name = ?, runner_id = NULL WHERE job_id = ?",
+            `${source.runner_name.replace(/-r\d+$/u, "")}-r${source.runner_attempt + 1}`,
+            source.job_id,
+          );
+        }
+        // The physical reservation already ended. Track the late signed start
+        // without claiming a live slot or provisioning a second runner.
         this.ctx.storage.sql.exec(
-          "UPDATE scheduler_jobs SET status = 'running', runner_name = ?, runner_id = ?, updated_at = ? WHERE job_id = ?",
+          "UPDATE scheduler_jobs SET status = 'stopped-awaiting-completion', runner_name = ?, runner_id = ?, container_stopped_at = ?, recovery_due_at = ?, updated_at = ? WHERE job_id = ?",
           input.runnerName,
-          input.runnerId ?? null,
+          runnerId,
+          source?.container_stopped_at ?? null,
+          now() + RUNNER_COMPLETION_GRACE_MS,
           now(),
           input.jobId,
         );
+        await this.scheduleWorkAlarmIfNeeded();
       }
       return { accepted: assignmentRecorded, admissions: [] };
     }
@@ -1469,6 +1484,8 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     const assignedJob = this.job(input.jobId);
     if (
       runner === undefined ||
+      ((assignedJob === undefined || assignedJob.github_assignment_observed === 0) &&
+        runner.created_at + runnerCacheTokenLifetimeMs <= now()) ||
       (runner.assigned_job_id !== null && runner.assigned_job_id !== input.jobId) ||
       runner.github_owner.toLowerCase() !== input.target.owner.toLowerCase() ||
       runner.github_repository.toLowerCase() !== input.target.repository.toLowerCase() ||
@@ -1488,7 +1505,35 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     return true;
   }
 
+  private deferReleaseForPendingAssignment(job: JobRow): boolean {
+    const current = this.job(job.job_id);
+    if (current?.container_stopped_at != null) return false;
+    const runner = this.rows<JitRunnerRow>(
+      "SELECT * FROM scheduler_jit_runners WHERE runner_name = ? AND assignment_observed = 1 AND assigned_job_id IS NOT NULL",
+      job.runner_name,
+    )[0];
+    if (
+      runner?.assigned_job_id == null ||
+      runner.assigned_job_id === job.job_id ||
+      this.job(runner.assigned_job_id) !== undefined ||
+      this.completionBeforeQueue(runner.assigned_job_id) !== undefined
+    )
+      return false;
+    // A pending signed assignment retains its existing physical reservation,
+    // bounded by the same lifetime as the JIT cache credential, never a retry.
+    const deadline = runner.created_at + runnerCacheTokenLifetimeMs;
+    if (deadline <= now()) return false;
+    this.ctx.storage.sql.exec(
+      "UPDATE scheduler_jobs SET recovery_due_at = ?, runner_cleanup_due_at = CASE WHEN runner_cleanup_due_at IS NOT NULL THEN ? ELSE NULL END WHERE job_id = ?",
+      deadline,
+      deadline,
+      job.job_id,
+    );
+    return true;
+  }
+
   private releaseJob(job: JobRow, status: "completed" | "cancelled" | "failed", reason?: string): void {
+    if (this.deferReleaseForPendingAssignment(job)) return;
     if (job.slot_id === null) {
       this.ctx.storage.sql.exec(
         `UPDATE scheduler_jobs
@@ -1553,6 +1598,12 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
       if (this.completionBeforeQueue(jobId) === undefined) {
         this.recordEvent("github-job-completed-before-queue", { jobId });
       }
+      this.ctx.storage.sql.exec(
+        "UPDATE scheduler_jobs SET recovery_due_at = ? WHERE runner_name IN (SELECT runner_name FROM scheduler_jit_runners WHERE assigned_job_id = ? AND assignment_observed = 1) AND status IN ('provisioning', 'running', 'releasing', 'stopped-awaiting-completion')",
+        now(),
+        jobId,
+      );
+      await this.scheduleWorkAlarmIfNeeded();
       return { accepted: true, admissions: [] };
     }
     this.ctx.storage.sql.exec(
@@ -1636,6 +1687,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   }
 
   private async retryRunnerCleanup(job: JobRow): Promise<void> {
+    if (this.deferReleaseForPendingAssignment(job)) return;
     const timestamp = now();
     if (job.runner_id === null) {
       this.ctx.storage.sql.exec(
@@ -1711,7 +1763,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     const timestamp = now();
     const stoppedJobs = this.rows<JobRow>(
       `SELECT * FROM scheduler_jobs
-       WHERE status IN ('stopped-awaiting-completion', 'releasing')
+       WHERE status IN ('stopped-awaiting-completion', 'releasing', 'running', 'provisioning')
          AND recovery_due_at IS NOT NULL
          AND recovery_due_at <= ?
        ORDER BY recovery_due_at ASC, job_id ASC`,
@@ -1719,6 +1771,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
     );
     const admissions: SchedulerAdmission[] = [];
     for (const job of stoppedJobs) {
+      if (this.deferReleaseForPendingAssignment(job)) continue;
       const awaitingContainerStop = job.status === "releasing";
       this.recordEvent(
         awaitingContainerStop ? "container-stop-missing-recovery-started" : "container-stop-recovery-started",
@@ -1775,6 +1828,7 @@ export class AccountRunnerScheduler extends DurableObject<WorkerEnvironment> {
   private releaseCompletedJobsAwaitingContainerStop(): void {
     const releasingJobs = this.rows<JobRow>("SELECT * FROM scheduler_jobs WHERE status = 'releasing'");
     for (const job of releasingJobs) {
+      if (this.deferReleaseForPendingAssignment(job)) continue;
       this.releaseJob(job, "completed");
       this.recordEvent("container-stop-missing-recovered", {
         jobId: job.job_id,

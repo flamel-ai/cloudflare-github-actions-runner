@@ -1,7 +1,8 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vite-plus/test";
 
-import type { SchedulerJobInput } from "../../src/account-runner-scheduler";
+import { AccountRunnerScheduler, type SchedulerJobInput } from "../../src/account-runner-scheduler";
+import { runnerCacheTokenLifetimeMs } from "../../src/runner-cache";
 import { RUNNER_PROFILES } from "../../src/runner-profiles";
 
 const target = { owner: "biw", repository: "runner-poc" };
@@ -87,6 +88,120 @@ describe("AccountRunnerScheduler JIT cache assignments", () => {
       expect(actual.status).toBe("running");
     });
   });
+
+  it.each([false, true])(
+    "retains pending physical reservation across restart and recovery with completion first %s",
+    async (completionFirst) => {
+      const scheduler = env.RUNNER_SCHEDULER.getByName(`pending-recovery-${completionFirst}`);
+      const source = job("710", "cf-standard-3-job-710", "refs/pull/710/merge");
+      const assigned = job("720", "cf-standard-3-job-720", "refs/pull/720/merge");
+      await scheduler.submit(source);
+      await provisionRunner(scheduler, source.jobId, source.runnerName, 7101);
+      if (completionFirst) await scheduler.workflowJobCompleted(source.jobId);
+      await scheduler.workflowJobStarted({
+        jobId: assigned.jobId,
+        runnerName: source.runnerName,
+        runnerId: 7101,
+        target,
+        profile,
+      });
+      if (!completionFirst) await scheduler.workflowJobCompleted(source.jobId);
+      await runInDurableObject(scheduler, async (_instance, state) => {
+        state.storage.sql.exec(
+          "UPDATE scheduler_jobs SET recovery_due_at = ? WHERE job_id = ?",
+          Date.now() - 1,
+          source.jobId,
+        );
+        state.storage.sql.exec(
+          "UPDATE scheduler_jobs SET runner_cleanup_state = 'retry', runner_cleanup_due_at = ? WHERE job_id = ?",
+          Date.now() - 1,
+          source.jobId,
+        );
+        const restarted = new AccountRunnerScheduler(state, env);
+        await state.blockConcurrencyWhile(async () => {});
+        await restarted.alarm();
+        const row = state.storage.sql
+          .exec<{ status: string; slot_id: string | null; runner_id: number | null }>(
+            "SELECT status,slot_id,runner_id FROM scheduler_jobs WHERE job_id = ?",
+            source.jobId,
+          )
+          .one();
+        expect(row.status).toBe("releasing");
+        expect(row.slot_id).toBe("preset:standard-3");
+        expect(row.runner_id).toBe(7101);
+      });
+      await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+      await scheduler.submit(assigned);
+      await runInDurableObject(scheduler, async (_instance, state) => {
+        const row = state.storage.sql
+          .exec<{ status: string; slot_id: string | null }>(
+            "SELECT status,slot_id FROM scheduler_jobs WHERE job_id = ?",
+            assigned.jobId,
+          )
+          .one();
+        expect(row).toEqual({ status: "running", slot_id: "preset:standard-3" });
+      });
+      await scheduler.runnerStopped(source.runnerName, { exitCode: 0, reason: "actual complete" });
+      await scheduler.workflowJobCompleted(assigned.jobId);
+      await runInDurableObject(scheduler, async (_instance, state) => {
+        const row = state.storage.sql
+          .exec<{ status: string }>("SELECT status FROM scheduler_jobs WHERE job_id = ?", assigned.jobId)
+          .one();
+        expect(row.status).toBe("completed");
+      });
+    },
+  );
+
+  it.each(["stop", "completion", "expiry"])(
+    "ends pending reservation after %s without granting early cache access",
+    async (ending) => {
+      const scheduler = env.RUNNER_SCHEDULER.getByName(`pending-end-${ending}`);
+      const source = job("730", "cf-standard-3-job-730", "refs/pull/730/merge");
+      const assigned = job("740", "cf-standard-3-job-740", "refs/pull/740/merge");
+      await scheduler.submit(source);
+      await provisionRunner(scheduler, source.jobId, source.runnerName, 7301);
+      await scheduler.workflowJobCompleted(source.jobId);
+      const claim = { jobId: assigned.jobId, runnerName: source.runnerName, runnerId: 7301, target, profile };
+      await scheduler.workflowJobStarted(claim);
+      if (ending === "stop") await scheduler.runnerStopped(source.runnerName, { exitCode: 0, reason: "physical stop" });
+      else {
+        if (ending === "completion") await scheduler.workflowJobCompleted(assigned.jobId);
+        await runInDurableObject(scheduler, async (_instance, state) => {
+          if (ending === "expiry")
+            state.storage.sql.exec(
+              "UPDATE scheduler_jit_runners SET created_at = ? WHERE runner_name = ?",
+              Date.now() - runnerCacheTokenLifetimeMs - 1,
+              source.runnerName,
+            );
+          state.storage.sql.exec(
+            "UPDATE scheduler_jobs SET runner_id = NULL, recovery_due_at = ? WHERE job_id = ?",
+            Date.now() - 1,
+            source.jobId,
+          );
+        });
+        await runInDurableObject(scheduler, async (instance) => {
+          await instance.alarm();
+        });
+      }
+      await expect(scheduler.cacheAssignment(source.runnerName, "biw/runner-poc")).resolves.toBeUndefined();
+      await runInDurableObject(scheduler, async (_instance, state) => {
+        const row = state.storage.sql
+          .exec<{ status: string }>("SELECT status FROM scheduler_jobs WHERE job_id = ?", source.jobId)
+          .one();
+        expect(row.status).toBe("completed");
+      });
+      await scheduler.submit(assigned);
+      await runInDurableObject(scheduler, async (_instance, state) => {
+        const row = state.storage.sql
+          .exec<{ status: string; slot_id: string | null }>(
+            "SELECT status,slot_id FROM scheduler_jobs WHERE job_id = ?",
+            assigned.jobId,
+          )
+          .one();
+        expect(row.status).not.toBe("running");
+      });
+    },
+  );
 
   it.each([false, true])("completion before queued delivery wins with start first %s", async (startFirst) => {
     const scheduler = env.RUNNER_SCHEDULER.getByName(`pending-completion-${startFirst}`);
